@@ -530,65 +530,144 @@ class DetachRocket(BaseDetach):
         if self.set_percentage is not None:
             self._log("Warning: Using fixed percentage for pruning. trade_off will be ignored.")
 
-    def fit(self, X, y=None, X_val=None, y_val=None, **kwargs):
-        """Fit the DetachRocket model.
+    def fit(
+        self,
+        X,
+        y=None,
+        X_val=None,
+        y_val=None,
+        y_identity=None,
+        identity_lambda=0.0,
+        **kwargs,
+    ):
+        """
+        Fit the DetachRocket model.
 
-        Transforms *X* using the ROCKET transformer, runs Sequential Feature
-        Detachment (SFD) to obtain an accuracy-vs-size curve, selects the
-        optimal pruning level, and retrains a ``RidgeClassifier`` on the
-        pruned features.
+        Supports both standard SFD and identity-aware SFD.
+
+        Standard SFD::
+
+            model.fit(
+                X_train,
+                y_train,
+                X_val=X_val,
+                y_val=y_val,
+            )
+
+        Identity-aware SFD::
+
+            model.fit(
+                X_train,
+                y_train,
+                X_val=X_val,
+                y_val=y_val,
+                y_identity=y_subject_train,
+                identity_lambda=0.5,
+            )
 
         Parameters
         ----------
         X : array-like
-            Training time series of shape
-            ``(n_instances, n_channels, n_timepoints)``.  For univariate
-            data aeon transformers also accept a 2D
-            ``(n_instances, n_timepoints)`` array.
-        y : array-like of shape (n_instances,)
-            Training labels.
-        X_val : array-like or None, default=None
-            Validation time series (same shape convention as *X*).  Required
-            when ``set_percentage`` is *None*.
-        y_val : array-like or None, default=None
-            Validation labels.
+            Training time series.
+        y : array-like
+            Primary task labels.
+        X_val : array-like or None
+            Validation time series.
+        y_val : array-like or None
+            Validation task labels.
+        y_identity : array-like or None
+            Subject-identity labels for the training data. If ``None``,
+            standard SFD is used. If provided, identity-aware SFD is used.
+        identity_lambda : float, default=0.0
+            Strength of the identity penalty. Must be non-negative.
+            Setting this to zero preserves the task-only feature ordering.
         **kwargs
-            Extra keyword arguments forwarded to
-            :func:`~detach_rocket.sfd.feature_detachment` (e.g.
-            ``drop_ratio``, ``num_steps``).  ``verbose`` and
-            ``multiclass_type`` are already passed from ``self``.
+            Extra arguments passed to :func:`feature_detachment`, such as
+            ``drop_ratio`` or ``num_steps``.
 
         Returns
         -------
         self
         """
+        # Validate normal DetachRocket inputs.
         self._validate_inputs(X, y, X_val, y_val)
 
-        self.scaler_ = StandardScaler(with_mean=True)
+        # Validate identity-aware inputs.
+        if identity_lambda < 0:
+            raise ValueError("identity_lambda must be non-negative.")
 
+        if y_identity is not None:
+            y_identity = np.asarray(y_identity)
+            if len(y_identity) != len(y):
+                raise ValueError(
+                    "y_identity must contain the same number of samples as y."
+                )
+
+        if identity_lambda > 0 and y_identity is None:
+            raise ValueError(
+                "y_identity must be provided when identity_lambda is greater than 0."
+            )
+
+        # Transform the training data with ROCKET.
+        self.scaler_ = StandardScaler(with_mean=True)
         self._log("Applying Data Transformation")
         self.feature_matrix_ = self._to_numpy(self.transformer.fit_transform(X))
-
         self.feature_matrix_ = self.scaler_.fit_transform(self.feature_matrix_)
 
-        use_validation = self.set_percentage is None and X_val is not None and y_val is not None
+        # Transform validation data.
+        use_validation = (
+            self.set_percentage is None
+            and X_val is not None
+            and y_val is not None
+        )
 
         if use_validation:
-            self.feature_matrix_val_ = self._to_numpy(self.transformer.transform(X_val))
-            self.feature_matrix_val_ = self.scaler_.transform(self.feature_matrix_val_)
+            self.feature_matrix_val_ = self._to_numpy(
+                self.transformer.transform(X_val)
+            )
+            self.feature_matrix_val_ = self.scaler_.transform(
+                self.feature_matrix_val_
+            )
         else:
             self.feature_matrix_val_ = None
 
+        # Fit the full primary-task model.
         self._log("Fitting Full Model")
-        full_classifier = RidgeClassifierCV(alphas=np.logspace(-10, 10, 20))
+        full_classifier = RidgeClassifierCV(
+            alphas=np.logspace(-10, 10, 20)
+        )
         with quiet_ridge_warnings():
             full_classifier.fit(self.feature_matrix_, y)
+
         self.full_classifier_ = full_classifier
         self.full_model_alpha_ = full_classifier.alpha_
-
         self.classifier_ = RidgeClassifier(alpha=self.full_model_alpha_)
 
-        self.retained_ratios_, self.train_scores_, self.val_scores_, self.importance_matrix_ = feature_detachment(
+        # Prepare the optional subject-identity classifier.
+        identity_classifier = None
+
+        if y_identity is not None:
+            self._log("Fitting identity classifier")
+
+            identity_cv = RidgeClassifierCV(
+                alphas=np.logspace(-10, 10, 20)
+            )
+            with quiet_ridge_warnings():
+                identity_cv.fit(self.feature_matrix_, y_identity)
+
+            identity_classifier = RidgeClassifier(
+                alpha=identity_cv.alpha_
+            )
+            with quiet_ridge_warnings():
+                identity_classifier.fit(self.feature_matrix_, y_identity)
+
+        # Run SFD.
+        (
+            self.retained_ratios_,
+            self.train_scores_,
+            self.val_scores_,
+            self.importance_matrix_,
+        ) = feature_detachment(
             self.classifier_,
             self.feature_matrix_,
             X_test=self.feature_matrix_val_ if use_validation else None,
@@ -596,15 +675,18 @@ class DetachRocket(BaseDetach):
             y_test=y_val if use_validation else None,
             verbose=self.verbose,
             multiclass_type=self.multiclass_type,
+            identity_classifier=identity_classifier,
+            y_identity=y_identity,
+            identity_lambda=identity_lambda,
             **kwargs,
         )
 
+        # Store labels.
         self.labels_ = y
         self.labels_val_ = y_val if use_validation else None
 
-        # Decide on the pruning level and retrain
+        # Select pruning level and retrain the final task classifier.
         self._select_pruning_step()
-
         self._retrain_at_step(self.selected_step_index_)
         self.is_fitted_ = True
 
@@ -620,7 +702,10 @@ class DetachRocket(BaseDetach):
 
         self._log("Initializing pruned transformer with the selected features")
         pruner = get_transformer_pruner(self.transformer)
-        self.pruned_transformer_ = pruner.prune_transformer(self.transformer, self.feature_mask_)
+        self.pruned_transformer_ = pruner.prune_transformer(
+            self.transformer,
+            self.feature_mask_,
+        )
 
         # Build a scaler for the pruned feature space by extracting the
         # mean and scale of the retained features from the full scaler.
@@ -634,25 +719,8 @@ class DetachRocket(BaseDetach):
     def detach(self):
         """Return a lightweight :class:`PrunedRocketModel` for inference.
 
-        The returned object contains only the pruned transformer, its
-        scaler, and the retrained classifier — the minimum needed to
-        call ``predict`` on new data.
-
-        Returns
-        -------
-        pruned_model : PrunedRocketModel
-
-        Raises
-        ------
-        ValueError
-            If the model has not been fitted yet.
-
-        Examples
-        --------
-        >>> model = DetachRocket(transformer=rocket, trade_off=0.1)
-        >>> model.fit(X_train, y_train, X_val=X_val, y_val=y_val)
-        >>> pruned = model.detach()
-        >>> y_pred = pruned.predict(X_test)
+        The returned object contains only the pruned transformer, its scaler,
+        and the retrained classifier.
         """
         self._require_fitted()
         return PrunedRocketModel(
@@ -662,22 +730,26 @@ class DetachRocket(BaseDetach):
         )
 
     def get_summary(self):
-        """Return a dictionary summarizing the fitted model.
-
-        Extends the base summary with ``retained_kernel_count``.
-
-        Returns
-        -------
-        summary : dict
-        """
+        """Return a dictionary summarizing the fitted DetachRocket model."""
         summary = super().get_summary()
-        # The CUDA pruned transformer names the attribute num_kernels, aeon's
-        # n_kernels; the generic wrapper exposes num_kernels=None, since kernel
-        # semantics are undefined for arbitrary transformers.
-        retained_kernel_count = getattr(self.pruned_transformer_, "num_kernels", None)
+
+        retained_kernel_count = getattr(
+            self.pruned_transformer_,
+            "num_kernels",
+            None,
+        )
         if retained_kernel_count is None:
-            retained_kernel_count = getattr(self.pruned_transformer_, "n_kernels", None)
-        summary["retained_kernel_count"] = None if retained_kernel_count is None else int(retained_kernel_count)
+            retained_kernel_count = getattr(
+                self.pruned_transformer_,
+                "n_kernels",
+                None,
+            )
+
+        summary["retained_kernel_count"] = (
+            None
+            if retained_kernel_count is None
+            else int(retained_kernel_count)
+        )
         return summary
 
 
@@ -685,7 +757,7 @@ class DetachMatrix(BaseDetach):
     """Detach model that operates on precomputed feature matrices.
 
     Applies Sequential Feature Detachment (SFD) directly to a feature
-    matrix of shape ``(n_instances, n_features)`` — useful when features
+    matrix of shape ``(n_instances, n_features)`` -- useful when features
     have already been extracted by an external pipeline (e.g. tsfresh,
     catch22, or a pre-fitted ROCKET transformer).
 
