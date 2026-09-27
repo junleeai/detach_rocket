@@ -35,6 +35,7 @@ NOISE_STD = 0.5
 
 def generate_synthetic_datasets(
     task_amplitude=TASK_AMPLITUDE,
+    random_seed=RANDOM_SEED,
 ):    
     """
     Generate three matched synthetic time-series datasets.
@@ -55,9 +56,13 @@ def generate_synthetic_datasets(
 
     The weak, medium, and strong datasets are identical
     except for the amplitude of the identity signal.
+    The random_seed argument controls subject-class assignment,
+    subject identity-frequency assignment, recording phases,
+    and Gaussian noise, allowing independent synthetic
+    realizations to be generated reproducibly.
     """
 
-    rng = np.random.default_rng(RANDOM_SEED)
+    rng = np.random.default_rng(random_seed)
 
     # -----------------------------------------------------
     # Subjects
